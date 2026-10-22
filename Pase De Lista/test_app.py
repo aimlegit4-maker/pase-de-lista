@@ -1,6 +1,7 @@
 import http.cookiejar
 import csv
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -145,6 +146,18 @@ class AttendanceFlowTests(unittest.TestCase):
         self.csrf[profile] = result["csrf_token"]
         return result
 
+    def login_password(self, profile, email, password):
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+        )
+        self.openers[profile] = opener
+        return self.request(
+            "/api/login",
+            method="POST",
+            body={"email": email, "password": password},
+            profile=profile,
+        )
+
     def configure_default_school(self):
         self.login("admin")
         _, dashboard = self.request("/api/dashboard", profile="admin")
@@ -258,7 +271,7 @@ class AttendanceFlowTests(unittest.TestCase):
         self.assertEqual(status, 429)
         self.assertIn("15 minutos", result["error"])
 
-    def test_demo_authentication_can_be_disabled(self):
+    def test_demo_access_code_is_rejected_when_demo_is_disabled(self):
         with patch.object(app, "DEMO_MODE", False):
             status, result = self.request(
                 "/api/login",
@@ -268,8 +281,8 @@ class AttendanceFlowTests(unittest.TestCase):
                     "access_code": "test-demo-code",
                 },
             )
-        self.assertEqual(status, 503)
-        self.assertIn("OIDC", result["error"])
+        self.assertEqual(status, 403)
+        self.assertIn("contraseña", result["error"])
 
     def test_closed_session_rejects_qr_scans(self):
         self.configure_default_school()
@@ -305,24 +318,26 @@ class AttendanceFlowTests(unittest.TestCase):
                 "full_name": "Docente nuevo",
                 "email": "docente.nuevo@escuela.test",
                 "role": "PROFESOR",
+                "password": "DocenteSeguro2026!",
             },
         )
         self.assertEqual(status, 201, result)
+
+        status, result = self.login_password(
+            "new-teacher", "docente.nuevo@escuela.test", "DocenteSeguro2026!"
+        )
+        self.assertEqual(status, 200, result)
 
         status, result = self.request(
             "/api/schools",
             method="POST",
             profile="admin",
-            body={
-                "name": "Plantel de prueba",
-                "timezone": "America/Mexico_City",
-            },
+            body={"name": "Plantel de prueba", "timezone": "America/Mexico_City"},
         )
         self.assertEqual(status, 201, result)
         _, dashboard = self.request("/api/dashboard", profile="admin")
         school_id = next(s["id"] for s in dashboard["schools"] if s["name"] == "Plantel de prueba")
         teacher = next(t for t in dashboard["teachers"] if t["email"] == "docente.nuevo@escuela.test")
-
         status, group = self.request(
             "/api/groups",
             method="POST",
@@ -336,22 +351,9 @@ class AttendanceFlowTests(unittest.TestCase):
         )
         self.assertEqual(status, 201, group)
 
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-        )
-        self.openers["new_teacher"] = opener
-        status, login_result = self.request(
-            "/api/login",
-            method="POST",
-            body={"email": teacher["email"], "access_code": "test-demo-code"},
-            profile="new_teacher",
-        )
-        self.assertEqual(status, 200, login_result)
-        self.csrf["new_teacher"] = login_result["csrf_token"]
-        _, teacher_dashboard = self.request("/api/dashboard", profile="new_teacher")
+        _, teacher_dashboard = self.request("/api/dashboard", profile="new-teacher")
         self.assertEqual([item["name"] for item in teacher_dashboard["groups"]], ["A-101"])
 
-        self.login("admin")
         status, _ = self.request(
             "/api/users",
             method="POST",
@@ -374,19 +376,76 @@ class AttendanceFlowTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, result)
 
-        self.openers["new_student"] = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
-        )
-        status, login_result = self.request(
-            "/api/login",
+    def test_admin_account_is_seeded_for_configured_email(self):
+        with app.db() as connection:
+            account = connection.execute(
+                """
+                SELECT u.email, GROUP_CONCAT(r.name) AS roles
+                FROM users u
+                JOIN user_roles ur ON ur.user_id = u.id
+                JOIN roles r ON r.id = ur.role_id
+                WHERE u.email = ?
+                GROUP BY u.id
+                """,
+                (app.ADMIN_EMAIL,),
+            ).fetchone()
+        self.assertIsNotNone(account)
+        self.assertIn("SUPER_ADMINISTRADOR", account["roles"])
+
+    def test_teacher_can_reset_password_with_email_code(self):
+        self.login("admin")
+        status, _ = self.request(
+            "/api/users",
             method="POST",
-            body={"email": student["email"], "access_code": "test-demo-code"},
-            profile="new_student",
+            profile="admin",
+            body={
+                "full_name": "Docente con recuperación",
+                "email": "recuperacion@escuela.test",
+                "role": "PROFESOR",
+                "password": "ClaveInicialSegura2026!",
+            },
         )
-        self.assertEqual(status, 200, login_result)
-        self.csrf["new_student"] = login_result["csrf_token"]
-        _, student_dashboard = self.request("/api/dashboard", profile="new_student")
-        self.assertEqual([item["name"] for item in student_dashboard["groups"]], ["A-101"])
+        self.assertEqual(status, 201)
+        status, _ = self.login_password(
+            "reset-teacher", "recuperacion@escuela.test", "ClaveInicialSegura2026!"
+        )
+        self.assertEqual(status, 200)
+
+        sent_codes = {}
+        with patch.dict(
+            os.environ,
+            {"PASELISTA_SMTP_USER": "mailer@example.test", "PASELISTA_SMTP_PASSWORD": "app-password"},
+        ), patch.object(
+            app,
+            "send_password_reset_email",
+            side_effect=lambda email, code: sent_codes.update(email=email, code=code),
+        ):
+            status, result = self.request(
+                "/api/password-reset/request",
+                method="POST",
+                body={"email": "recuperacion@escuela.test"},
+            )
+        self.assertEqual(status, 200, result)
+        self.assertEqual(sent_codes["email"], "recuperacion@escuela.test")
+
+        status, result = self.request(
+            "/api/password-reset/confirm",
+            method="POST",
+            body={
+                "email": "recuperacion@escuela.test",
+                "code": sent_codes["code"],
+                "password": "ClaveNuevaSegura2026!",
+            },
+        )
+        self.assertEqual(status, 200, result)
+        status, _ = self.login_password(
+            "old-password", "recuperacion@escuela.test", "ClaveInicialSegura2026!"
+        )
+        self.assertEqual(status, 403)
+        status, result = self.login_password(
+            "new-password", "recuperacion@escuela.test", "ClaveNuevaSegura2026!"
+        )
+        self.assertEqual(status, 200, result)
 
     def test_student_attendance_sends_guardian_sms_without_location(self):
         self.configure_default_school()
@@ -398,7 +457,7 @@ class AttendanceFlowTests(unittest.TestCase):
             body={
                 "email": "estudiante.aviso@escuela.test",
                 "role": "ESTUDIANTE",
-                "matricula": "241440424-6",
+                "matricula": "241440426-6",
                 "guardian_phone": "5512345678",
             },
         )
@@ -439,7 +498,7 @@ class AttendanceFlowTests(unittest.TestCase):
             )
         self.assertEqual(status, 201, result)
         self.assertTrue(result["notification"]["sent"])
-        send_sms.assert_called_once_with("+525512345678", "241440424-6")
+        send_sms.assert_called_once_with("+525512345678", "241440426-6")
 
     def test_twilio_sms_uses_configured_sender_and_guardian_number(self):
         with (

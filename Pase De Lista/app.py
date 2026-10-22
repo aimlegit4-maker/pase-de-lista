@@ -8,9 +8,11 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 import threading
 from datetime import date, datetime, time, timedelta, timezone
+from email.message import EmailMessage
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +29,7 @@ HOST = os.getenv("PASELISTA_HOST", "127.0.0.1")
 PORT = int(os.getenv("PASELISTA_PORT", "8000"))
 DEMO_MODE = os.getenv("PASELISTA_DEMO_MODE", "1").lower() in {"1", "true", "yes"}
 DEMO_ACCESS_CODE = os.getenv("PASELISTA_DEMO_ACCESS_CODE") or secrets.token_urlsafe(9)
+ADMIN_EMAIL = os.getenv("PASELISTA_ADMIN_EMAIL", "haressanchez506@gmail.com").strip().lower()
 TOKEN_TTL_SECONDS = int(os.getenv("PASELISTA_TOKEN_TTL_SECONDS", "60"))
 MAX_TOKEN_ATTEMPTS = 5
 SESSION_LIFETIME_HOURS = 12
@@ -203,6 +206,8 @@ def initialize_database():
             connection.execute("ALTER TABLE users ADD COLUMN guardian_phone TEXT")
         if "qr_token_hash" not in user_columns:
             connection.execute("ALTER TABLE users ADD COLUMN qr_token_hash TEXT")
+        if "password_hash" not in user_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_matricula "
             "ON users(matricula) WHERE matricula IS NOT NULL"
@@ -248,6 +253,32 @@ def initialize_database():
                 WHERE u.email = ?
                 """,
                 (role, email),
+            )
+        if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,190}", ADMIN_EMAIL):
+            raise ValueError("PASELISTA_ADMIN_EMAIL debe ser un correo válido")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO users (email, full_name, provider, external_id, active)
+            VALUES (?, 'Administrador principal', 'password', ?, 1)
+            """,
+            (ADMIN_EMAIL, "password:" + ADMIN_EMAIL),
+        )
+        admin_user = connection.execute(
+            "SELECT id, password_hash FROM users WHERE email = ?", (ADMIN_EMAIL,)
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO user_roles (user_id, role_id)
+            SELECT ?, id FROM roles WHERE name = 'SUPER_ADMINISTRADOR'
+            """,
+            (admin_user["id"],),
+        )
+        initial_admin_password = os.getenv("PASELISTA_ADMIN_PASSWORD", "")
+        if initial_admin_password and not admin_user["password_hash"]:
+            validate_password(initial_admin_password)
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (password_digest(initial_admin_password), admin_user["id"]),
             )
 
         connection.execute(
@@ -387,6 +418,66 @@ def token_hash(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+PASSWORD_ITERATIONS = 310_000
+
+
+def validate_password(password):
+    if (
+        not isinstance(password, str)
+        or len(password) < 12
+        or len(password) > 128
+        or any(ord(char) < 32 for char in password)
+    ):
+        raise ValueError("La contraseña debe tener entre 12 y 128 caracteres")
+    return password
+
+
+def password_digest(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def password_matches(password, encoded):
+    if not isinstance(password, str) or not isinstance(encoded, str):
+        return False
+    try:
+        algorithm, rounds, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
+        )
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def reset_code_hash(user_id, code):
+    return hmac.new(PIN_PEPPER, f"password-reset:{user_id}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def send_password_reset_email(email, code):
+    smtp_user = os.getenv("PASELISTA_SMTP_USER", "")
+    smtp_password = os.getenv("PASELISTA_SMTP_PASSWORD", "")
+    if not smtp_user or not smtp_password:
+        raise RuntimeError("Configura PASELISTA_SMTP_USER y PASELISTA_SMTP_PASSWORD")
+    message = EmailMessage()
+    message["Subject"] = "Código para recuperar tu cuenta de Pase de Lista"
+    message["From"] = os.getenv("PASELISTA_SMTP_FROM", smtp_user)
+    message["To"] = email
+    message.set_content(
+        f"Tu código de recuperación es {code}. Vence en 10 minutos. "
+        "Si no solicitaste este código, ignora este correo."
+    )
+    host = os.getenv("PASELISTA_SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("PASELISTA_SMTP_PORT", "587"))
+    with smtplib.SMTP(host, port, timeout=15) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.send_message(message)
+
+
 def new_qr_credential():
     token = secrets.token_urlsafe(32)
     svg = qrcode.make(f"PL1:{token}", image_factory=SvgPathImage).to_string().decode("utf-8")
@@ -511,7 +602,10 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "demo_mode": DEMO_MODE,
                     "timezone": DEFAULT_TIMEZONE,
-                    "authentication": "demonstration" if DEMO_MODE else "oidc_required",
+                    "authentication": "password",
+                    "password_recovery": bool(
+                        os.getenv("PASELISTA_SMTP_USER") and os.getenv("PASELISTA_SMTP_PASSWORD")
+                    ),
                 },
             )
         elif path == "/api/me":
@@ -535,6 +629,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/api/password-reset/request":
+                self.request_password_reset()
+                return
+            if path == "/api/password-reset/confirm":
+                self.confirm_password_reset()
+                return
             if path == "/api/login":
                 self.login()
                 return
@@ -552,6 +652,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/groups": lambda: self.create_group(user),
                 "/api/enrollments": lambda: self.enroll_student(user),
                 "/api/sessions/start": lambda: self.start_session(user),
+                "/api/attendance": lambda: self.register_attendance(user),
             }
             if path in routes:
                 routes[path]()
@@ -581,16 +682,10 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, 409, {"error": "La operación entra en conflicto con los datos existentes"})
 
     def login(self):
-        if not DEMO_MODE:
-            json_response(
-                self,
-                503,
-                {"error": "El inicio institucional OIDC debe configurarse antes de aceptar usuarios"},
-            )
-            return
         data = request_json(self)
         email = str(data.get("email", "")).strip().lower()
         access_code = data.get("access_code", "")
+        password = data.get("password", "")
         client_key = self.client_address[0]
         with db() as connection:
             now = utc_now()
@@ -614,10 +709,23 @@ class Handler(BaseHTTPRequestHandler):
             ) > now:
                 json_response(self, 429, {"error": "Demasiados intentos; espera 15 minutos"})
                 return
-            valid_code = isinstance(access_code, str) and hmac.compare_digest(
-                access_code, DEMO_ACCESS_CODE
+            account = connection.execute(
+                "SELECT password_hash FROM users WHERE email = ? AND active = 1",
+                (email,),
+            ).fetchone()
+            valid_password = password_matches(
+                password, account["password_hash"] if account else None
             )
-            if not email or not valid_code:
+            valid_demo_code = (
+                DEMO_MODE
+                and (
+                    email in DEMO_ACCOUNTS
+                    or (account and account["password_hash"] is None and email != ADMIN_EMAIL)
+                )
+                and isinstance(access_code, str)
+                and hmac.compare_digest(access_code, DEMO_ACCESS_CODE)
+            )
+            if not email or not (valid_password or valid_demo_code):
                 in_window = bool(
                     attempt
                     and now - datetime.fromisoformat(attempt["window_started_at"])
@@ -641,7 +749,7 @@ class Handler(BaseHTTPRequestHandler):
                     """,
                     (client_key, attempts, window_started, blocked_until),
                 )
-                json_response(self, 403, {"error": "Cuenta o código de demostración incorrecto"})
+                json_response(self, 403, {"error": "Correo o contraseña incorrectos"})
                 return
             connection.execute("DELETE FROM login_attempts WHERE client_key = ?", (client_key,))
             user = connection.execute(
@@ -658,8 +766,12 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 json_response(self, 403, {"error": "La cuenta no existe, está desactivada o no tiene un rol asignado"})
                 return
-            if not is_admin(user) and not has_role(user, "PROFESOR"):
-                json_response(self, 403, {"error": "Esta aplicación es exclusiva para profesores"})
+            if not (
+                is_admin(user)
+                or has_role(user, "PROFESOR")
+                or has_role(user, "ESTUDIANTE")
+            ):
+                json_response(self, 403, {"error": "La cuenta no tiene un rol habilitado"})
                 return
             session_token = secrets.token_urlsafe(32)
             csrf_token = secrets.token_urlsafe(24)
@@ -675,7 +787,7 @@ class Handler(BaseHTTPRequestHandler):
             audit(connection, user["id"], "login", "user", user["id"])
         payload = {
             "ok": True,
-            "message": "Sesión de demostración iniciada",
+            "message": "Sesión iniciada correctamente",
             "user": {"email": user["email"], "name": user["full_name"], "roles": user["roles"]},
             "csrf_token": csrf_token,
         }
@@ -690,6 +802,125 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def request_password_reset(self):
+        data = request_json(self)
+        email = str(data.get("email", "")).strip().lower()
+        if not os.getenv("PASELISTA_SMTP_USER") or not os.getenv("PASELISTA_SMTP_PASSWORD"):
+            json_response(self, 503, {"error": "La recuperación por correo aún no está configurada"})
+            return
+        generic_response = {
+            "ok": True,
+            "message": "Si la cuenta existe, recibirás un código por correo.",
+        }
+        if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]{1,190}", email):
+            json_response(self, 200, generic_response)
+            return
+
+        now = utc_now()
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        with db() as connection:
+            account = connection.execute(
+                """
+                SELECT id FROM users
+                WHERE email = ? AND active = 1 AND password_hash IS NOT NULL
+                """,
+                (email,),
+            ).fetchone()
+            if not account:
+                json_response(self, 200, generic_response)
+                return
+            existing = connection.execute(
+                "SELECT created_at FROM password_reset_codes WHERE user_id = ?",
+                (account["id"],),
+            ).fetchone()
+            if existing and now - datetime.fromisoformat(existing["created_at"]) < timedelta(minutes=1):
+                json_response(self, 200, generic_response)
+                return
+            connection.execute(
+                """
+                INSERT INTO password_reset_codes (user_id, code_hash, expires_at, created_at, attempts)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    code_hash = excluded.code_hash,
+                    expires_at = excluded.expires_at,
+                    created_at = excluded.created_at,
+                    attempts = 0
+                """,
+                (
+                    account["id"],
+                    reset_code_hash(account["id"], code),
+                    (now + timedelta(minutes=10)).isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                ),
+            )
+            user_id = account["id"]
+        try:
+            send_password_reset_email(email, code)
+        except (OSError, RuntimeError, smtplib.SMTPException) as error:
+            with db() as connection:
+                connection.execute(
+                    "DELETE FROM password_reset_codes WHERE user_id = ?", (user_id,)
+                )
+            print(f"No se pudo enviar el código de recuperación: {error}")
+            json_response(self, 503, {"error": "No se pudo enviar el correo de recuperación"})
+            return
+        json_response(self, 200, generic_response)
+
+    def confirm_password_reset(self):
+        data = request_json(self)
+        email = str(data.get("email", "")).strip().lower()
+        code = data.get("code", "")
+        password = validate_password(data.get("password"))
+        if not isinstance(code, str) or not re.fullmatch(r"\d{6}", code):
+            raise ValueError("El código debe tener seis dígitos")
+        with db() as connection:
+            account = connection.execute(
+                """
+                SELECT id FROM users
+                WHERE email = ? AND active = 1 AND password_hash IS NOT NULL
+                """,
+                (email,),
+            ).fetchone()
+            reset = (
+                connection.execute(
+                    "SELECT * FROM password_reset_codes WHERE user_id = ?",
+                    (account["id"],),
+                ).fetchone()
+                if account
+                else None
+            )
+            now = utc_now()
+            if (
+                not account
+                or not reset
+                or reset["attempts"] >= 5
+                or datetime.fromisoformat(reset["expires_at"]) <= now
+                or not hmac.compare_digest(
+                    reset["code_hash"], reset_code_hash(account["id"], code)
+                )
+            ):
+                if reset and reset["attempts"] < 5:
+                    connection.execute(
+                        "UPDATE password_reset_codes SET attempts = attempts + 1 WHERE user_id = ?",
+                        (account["id"],),
+                    )
+                json_response(self, 403, {"error": "El código es incorrecto o venció"})
+                return
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (password_digest(password), account["id"]),
+            )
+            connection.execute(
+                "DELETE FROM password_reset_codes WHERE user_id = ?", (account["id"],)
+            )
+            connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (account["id"],))
+            audit(connection, account["id"], "password_reset", "user", account["id"])
+        json_response(
+            self,
+            200,
+            {"ok": True, "message": "Contraseña actualizada. Ya puedes iniciar sesión."},
+        )
 
     def logout(self):
         parsed = cookies.SimpleCookie(self.headers.get("Cookie", ""))
@@ -833,6 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Selecciona el rol de profesor o estudiante")
         matricula = None
         guardian_phone = None
+        password_hash = None
         name = clean_text(data, "full_name", "Nombre", 120) if role == "PROFESOR" else ""
         if role == "ESTUDIANTE":
             matricula = clean_text(data, "matricula", "Matrícula", 20)
@@ -843,15 +1075,17 @@ class Handler(BaseHTTPRequestHandler):
             qr_token, qr_svg = new_qr_credential()
             qr_token_hash = token_hash(qr_token)
         else:
+            password = validate_password(data.get("password"))
+            password_hash = password_digest(password)
             qr_svg = None
             qr_token_hash = None
         with db() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO users
-                    (email, full_name, matricula, guardian_phone, qr_token_hash,
+                    (email, full_name, matricula, guardian_phone, qr_token_hash, password_hash,
                      provider, external_id, active)
-                VALUES (?, ?, ?, ?, ?, 'admin_provisioned_demo', ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, 'admin_provisioned_demo', ?, 1)
                 """,
                 (
                     email,
@@ -859,6 +1093,7 @@ class Handler(BaseHTTPRequestHandler):
                     matricula,
                     guardian_phone,
                     qr_token_hash,
+                    password_hash,
                     "provisioned:" + secrets.token_urlsafe(24),
                 ),
             )
@@ -1335,13 +1570,11 @@ class Server(ThreadingHTTPServer):
 def main():
     if TOKEN_TTL_SECONDS <= 0:
         raise ValueError("PASELISTA_TOKEN_TTL_SECONDS debe ser mayor que cero")
-    if DEMO_MODE and not os.getenv("PASELISTA_DEMO_ACCESS_CODE"):
-        print("Código de acceso de demostración (compártelo sólo para la demo):", DEMO_ACCESS_CODE)
     initialize_database()
     print(f"Pase de Lista ejecutándose en http://{HOST}:{PORT}")
     print("Este servidor sólo acepta HTTP; no abras la dirección con https://.")
     print(f"Base de datos: {DB_PATH}")
-    print("Modo de autenticación:", "DEMO (no usar en producción)" if DEMO_MODE else "OIDC requerido")
+    print("Autenticación de cuentas: correo y contraseña")
     if COOKIE_SECURE:
         print("Cookies seguras: activas")
     Server((HOST, PORT), Handler).serve_forever()

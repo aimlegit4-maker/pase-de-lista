@@ -1,4 +1,4 @@
-const CACHE_NAME = "pase-lista-docente-v3";
+const CACHE_NAME = "pase-lista-docente-v4";
 const APP_FILES = [
   "/",
   "/manifest.webmanifest",

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS users (
     matricula TEXT,
     guardian_phone TEXT,
     qr_token_hash TEXT UNIQUE,
+    password_hash TEXT,
     provider TEXT NOT NULL DEFAULT 'demo',
     external_id TEXT NOT NULL UNIQUE,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
@@ -86,6 +87,14 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_codes (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
