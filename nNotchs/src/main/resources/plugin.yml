@@ -1,0 +1,6 @@
+name: nNotchs
+version: '${version}'
+
+main: com.aimlegit.nNotchs.NNotchs
+api-version: '1.21.4'
+load: POSTWORLD
