@@ -1,5 +1,0 @@
-saturation:
-  # Ticks between each saturation-powered heart regeneration.
-  regeneration-interval-ticks: 10
-  # Exhaustion points spent for each heart; 4 exhaustion points consume 1 saturation point.
-  exhaustion-per-heart: 6.0
