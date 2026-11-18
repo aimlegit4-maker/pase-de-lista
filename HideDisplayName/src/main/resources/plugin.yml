@@ -1,6 +1,0 @@
-name: HideDisplayName
-version: '${version}'
-
-main: sheal.heal.hideDisplayName.HideDisplayName
-api-version: '26.3'
-load: POSTWORLD
